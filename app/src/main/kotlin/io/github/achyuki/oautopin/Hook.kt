@@ -420,7 +420,8 @@ class Hook : XposedModule() {
         }
 
         for (slot in locked) {
-            val pin = config.pinForSlot(slot) ?: run {
+            val pin = config.pinForSlot(slot)
+            if (pin == null) {
                 moduleLog(this, Log.WARN, "slot ${slot + 1} is locked but has no PIN")
                 continue
             }
