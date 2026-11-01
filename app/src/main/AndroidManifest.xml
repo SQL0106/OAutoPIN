@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Module metadata lives in resources/META-INF/xposed/ (libxposed API 102).
-         The legacy xposedmodule / xposeddescription / xposedminversion /
-         xposedscope meta-data block must not come back: the modern framework
-         reads META-INF/xposed/*.list and rejects mixed declarations. -->
+    <!-- Module metadata lives in resources/META-INF/xposed/ (libxposed API 102):
+         java_init.list, module.prop, scope.list. Do not reintroduce the legacy
+         manifest meta-data block, and do not even mention its key names in this
+         file — CI greps the tree for those tokens to reject mixed declarations. -->
 
     <application
         android:allowBackup="false"
