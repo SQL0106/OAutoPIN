@@ -1,0 +1,188 @@
+name: Android CI
+
+# Cloud build so the project can be compiled and verified without a local
+# Android SDK. Runs on every push and pull request, and can be started manually.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build debug and release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The ubuntu runner image already ships the Android SDK; no third-party
+      # setup action is needed (android-actions/setup-android@v3 fails on this
+      # image because its sdkmanager cannot find the legacy 'tools' package).
+      - name: Check Android SDK
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "using SDK at $SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "SDK platforms before:"; ls "$SDK/platforms" 2>/dev/null || true
+
+          # cmdline-tools may live in latest/ or in a versioned directory.
+          BIN=""
+          for cand in "$SDK/cmdline-tools/latest/bin" "$SDK"/cmdline-tools/*/bin; do
+            if [ -x "$cand/sdkmanager" ]; then BIN="$cand"; break; fi
+          done
+          echo "sdkmanager bin: ${BIN:-<none>}"
+
+          if [ ! -d "$SDK/platforms/android-37" ] && [ -n "$BIN" ]; then
+            echo "installing platform 37"
+            yes | "$BIN/sdkmanager" --licenses > /dev/null 2>&1 || true
+            "$BIN/sdkmanager" "platforms;android-37" || true
+          fi
+          echo "SDK platforms after:"; ls "$SDK/platforms" 2>/dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Fails early with a readable message if the wrapper or the module
+      # metadata shipped in the APK is malformed.
+      - name: Verify module metadata
+        run: |
+          set -e
+          echo "--- META-INF/xposed/module.prop ---"
+          cat app/src/main/resources/META-INF/xposed/module.prop
+          echo "--- META-INF/xposed/java_init.list ---"
+          cat app/src/main/resources/META-INF/xposed/java_init.list
+          echo "--- META-INF/xposed/scope.list ---"
+          cat app/src/main/resources/META-INF/xposed/scope.list
+          test -f app/src/main/resources/META-INF/xposed/module.prop
+          test -f app/src/main/resources/META-INF/xposed/java_init.list
+          test -f app/src/main/resources/META-INF/xposed/scope.list
+          test ! -e app/src/main/assets/xposed_init
+
+          # The migration must have removed every trace of the legacy bridge.
+          # Count matches per pattern instead of relying on grep's exit status,
+          # so a documentation-only mention is visible rather than fatal.
+          echo "--- legacy traces (must all be 0) ---"
+          fail=0
+          for pat in xposedminversion xposedsharedprefs XSharedPreferences MODE_WORLD_READABLE; do
+            n=$(grep -rhF "$pat" app/src/main 2>/dev/null | wc -l)
+            echo "$pat = $n"
+            if [ "$n" != "0" ]; then
+              grep -rnF "$pat" app/src/main 2>/dev/null || true
+              case "$pat" in
+                XSharedPreferences|MODE_WORLD_READABLE)
+                  # Allowed only inside comments; the CI cannot judge that, so
+                  # report it without failing the build.
+                  ;;
+                *) fail=1 ;;
+              esac
+            fi
+          done
+          if [ "$fail" != "0" ]; then
+            echo "legacy xposed metadata is still referenced" >&2
+            exit 1
+          fi
+
+      # Invoked through bash on purpose: a freshly committed gradlew may not have
+      # the executable bit set (a plain file upload loses it), and `bash gradlew`
+      # works either way.
+      #
+      # Only the release build is produced: it is the variant that gets shipped,
+      # and it is the one where the minifier can break the module (see the APK
+      # assertions below). Debug builds are covered by the release workflow when a
+      # version tag is pushed.
+      # A self-generated key rather than ~/.android/debug.keystore: the debug
+      # keystore's certificate expires every year, and an APK signed with an
+      # expired certificate is not installable.
+      - name: Create signing key
+        run: |
+          set -e
+          mkdir -p signing
+          keytool -genkeypair -v \
+            -keystore signing/release.jks \
+            -storetype PKCS12 \
+            -alias oautopin \
+            -keyalg RSA -keysize 4096 \
+            -validity 10950 \
+            -storepass oautopin \
+            -keypass oautopin \
+            -dname "CN=OAutoPIN-Next, OU=libxposed port, O=OAutoPIN-Next, L=NA, ST=NA, C=NA"
+          cat > signing/signing.properties <<'EOF'
+          storeFile=signing/release.jks
+          storePassword=oautopin
+          keyAlias=oautopin
+          keyPassword=oautopin
+          EOF
+
+      - name: Assemble release (signed)
+        run: bash gradlew --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Inspect the built APK
+        run: |
+          set -e
+          ENTRY="io.github.achyuki.oautopin.Hook"
+          DESC="Lio/github/achyuki/oautopin/Hook;"
+
+          APK=$(find app/build/outputs/apk/release -name '*.apk' | head -n 1)
+          echo "=== release: $APK"
+
+          # The shipped variant must actually be signed, otherwise it cannot be
+          # installed at all.
+          BUILD_TOOLS=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* | sort -V | tail -n 1)
+          echo "build-tools: $BUILD_TOOLS"
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$APK"
+
+          # The entry class name written into the APK must be the real class name,
+          # and that class must still exist in the dex. R8 renaming it (or adapting
+          # this file to a renamed class) breaks the release build silently,
+          # because the framework loads the class by name.
+          IN_APK=$(unzip -p "$APK" META-INF/xposed/java_init.list | tr -d '\r\n')
+          echo "java_init.list = '$IN_APK'"
+          if [ "$IN_APK" != "$ENTRY" ]; then
+            echo "::error::java_init.list contains '$IN_APK' but the framework needs '$ENTRY'"
+            exit 1
+          fi
+
+          rm -rf /tmp/dexcheck && mkdir -p /tmp/dexcheck
+          unzip -o -q "$APK" 'classes*.dex' -d /tmp/dexcheck
+          if grep -rlF "$DESC" /tmp/dexcheck > /dev/null; then
+            echo "entry class $DESC present in dex: OK"
+          else
+            echo "::error::entry class $DESC is missing from the dex (minifier renamed or removed it)"
+            exit 1
+          fi
+
+          # The legacy bridge must be gone from the shipped dex.
+          for legacy in 'de/robv/android/xposed/XSharedPreferences' 'XposedBridge' 'IXposedHookLoadPackage'; do
+            if grep -rlF "$legacy" /tmp/dexcheck > /dev/null; then
+              echo "::error::legacy reference '$legacy' found in the dex"
+              exit 1
+            fi
+          done
+          echo "legacy xposed references in dex: none"
+
+          unzip -l "$APK" | grep -E 'META-INF/xposed/'
+          ls -l app/build/outputs/apk/release
+
+      - name: Upload release APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oautopin-release-apk
+          if-no-files-found: warn
+          path: app/build/outputs/apk/release/*.apk

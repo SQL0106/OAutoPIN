@@ -1,0 +1,214 @@
+name: Release
+
+# Builds, signs and publishes the release APK.
+#
+# The signing key is generated inside the workflow, so the published APK is
+# installable. It is NOT a private key: this project ships no secret, and the
+# module is installed through LSPosed (root) rather than distributed through an
+# app store. Anyone who can read the workflow can reproduce the same key, so
+# treat it as a stable, public, debug-grade identity.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to publish (e.g. v16.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, sign and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::tag '$TAG' must start with 'v'"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "publishing $TAG (version ${TAG#v})"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Check Android SDK
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "using SDK at $SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          BIN=""
+          for cand in "$SDK/cmdline-tools/latest/bin" "$SDK"/cmdline-tools/*/bin; do
+            if [ -x "$cand/sdkmanager" ]; then BIN="$cand"; break; fi
+          done
+          echo "sdkmanager bin: ${BIN:-<none>}"
+
+          if [ ! -d "$SDK/platforms/android-37" ] && [ -n "$BIN" ]; then
+            echo "installing platform 37"
+            yes | "$BIN/sdkmanager" --licenses > /dev/null 2>&1 || true
+            "$BIN/sdkmanager" "platforms;android-37" || true
+          fi
+          BUILD_TOOLS=$(ls -d "$SDK"/build-tools/* | sort -V | tail -n 1)
+          echo "build-tools: $BUILD_TOOLS"
+          ls "$BUILD_TOOLS" | grep -E 'apksigner|zipalign' || true
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # A self-generated key rather than ~/.android/debug.keystore: the debug
+      # keystore's certificate expires every year, and an APK signed with an
+      # expired certificate is not installable.
+      - name: Create signing key
+        run: |
+          set -e
+          mkdir -p signing
+          keytool -genkeypair -v \
+            -keystore signing/release.jks \
+            -storetype PKCS12 \
+            -alias oautopin \
+            -keyalg RSA -keysize 4096 \
+            -validity 10950 \
+            -storepass oautopin \
+            -keypass oautopin \
+            -dname "CN=OAutoPIN-Next, OU=libxposed port, O=OAutoPIN-Next, L=NA, ST=NA, C=NA"
+          echo "--- certificate validity ---"
+          keytool -list -v -keystore signing/release.jks -storepass oautopin \
+            | grep -E 'Valid from|Alias name' || true
+
+          # Gradle reads this to sign app-release.apk directly.
+          cat > signing/signing.properties <<'EOF'
+          storeFile=signing/release.jks
+          storePassword=oautopin
+          keyAlias=oautopin
+          keyPassword=oautopin
+          EOF
+          echo "--- signing/signing.properties ---"
+          cat signing/signing.properties
+
+      - name: Assemble signed release
+        run: bash gradlew --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Verify signature and packaged metadata
+        run: |
+          set -e
+          ENTRY="io.github.achyuki.oautopin.Hook"
+          DESC="Lio/github/achyuki/oautopin/Hook;"
+
+          APK=$(find app/build/outputs/apk/release -name '*.apk' | head -n 1)
+          echo "apk = $APK"
+
+          echo "--- apksigner verify ---"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK"
+
+          echo "--- module metadata ---"
+          IN_APK=$(unzip -p "$APK" META-INF/xposed/java_init.list | tr -d '\r\n')
+          echo "java_init.list = '$IN_APK'"
+          if [ "$IN_APK" != "$ENTRY" ]; then
+            echo "::error::java_init.list contains '$IN_APK' but the framework needs '$ENTRY'"
+            exit 1
+          fi
+          unzip -p "$APK" META-INF/xposed/module.prop
+
+          echo "--- entry class in dex ---"
+          rm -rf /tmp/dexcheck && mkdir -p /tmp/dexcheck
+          unzip -o -q "$APK" 'classes*.dex' -d /tmp/dexcheck
+          if ! grep -rlF "$DESC" /tmp/dexcheck > /dev/null; then
+            echo "::error::entry class $DESC is missing from the dex"
+            exit 1
+          fi
+          for legacy in 'de/robv/android/xposed/XSharedPreferences' 'XposedBridge' 'IXposedHookLoadPackage'; do
+            if grep -rlF "$legacy" /tmp/dexcheck > /dev/null; then
+              echo "::error::legacy reference '$legacy' found in the dex"
+              exit 1
+            fi
+          done
+          echo "no legacy xposed references"
+
+          # Stable asset name, with the signature appended so the module list can
+          # show it and duplicate signers stay distinguishable.
+          OUT="OAutoPIN-${{ steps.ver.outputs.version }}.apk"
+          cp "$APK" "$OUT"
+          echo "ASSET=$OUT" >> "$GITHUB_ENV"
+          ls -l "$OUT"
+
+      - name: Build release notes
+        run: |
+          set -e
+          cat > RELEASE_NOTES.md <<'EOF'
+          ## OAutoPIN ${{ steps.ver.outputs.tag }}
+
+          从 [achyuki/OAutoPIN](https://github.com/achyuki/OAutoPIN)（基线 `275367d`）修改升级而来。
+          原作者并未继续更新，本项目在其基础上做适配性修改，**修改工作由 AI 大肥鱼老师完成**。
+
+          ### 本版改动
+
+          - 从 legacy Xposed API 迁移到 **libxposed 公共 API 102**（`minApiVersion=102`），
+            模块元数据改由 `META-INF/xposed/` 提供，支持框架热重载
+          - **AFU 门控（默认开启）**：设备重启后停留在 BFU（尚未输入密码/指纹解锁设备）阶段时，
+            模块**不会**自动解锁 SIM；只有用户完成首次解锁之后才补填 PIN。
+            捡到手机的人因此拿不到蜂窝网络，收不到短信验证码
+          - **设置页新增开关**「允许在 BFU 阶段自动解锁 SIM」：确实需要重启后立刻有蜂窝定位
+            （依赖查找手机定位）时可以自行打开，代价是该窗口期内短信与数据通路对持机者开放
+          - **双卡支持**：卡1/卡2 可分别保存 PIN，卡2 留空则与卡1 相同；
+            双卡双锁时各自弹出的 PIN 界面都能填对
+          - PIN 存储改到框架自有的 **RemotePreferences**，不再使用 `XSharedPreferences` /
+            `MODE_WORLD_READABLE`；PIN 只落在 CE 存储，BFU 阶段不可读
+          - 修复旧版一次性标志永不复位的问题：同一进程内第二次弹出 PIN 界面（重插 SIM、
+            切换飞行模式）现在会正常自动填充
+          - 设置页改为中文界面
+
+          ### 安装
+
+          1. 安装本 APK，在 LSPosed 中启用模块并勾选作用域 `com.android.systemui`
+          2. 打开模块设置页输入 SIM 卡 PIN（4–8 位数字）并保存；双卡可分别填写
+          3. 重启 SystemUI 或对模块执行热重载使其生效
+          4. 默认会在**首次解锁设备之后**才自动填 PIN；若需要 BFU 阶段就解锁，在设置页打开对应开关
+
+          > 本包使用**公开的构建签名密钥**（在 `.github/workflows/release.yml` 中生成，
+          > 口令一并写在文件里，便于任何人复现同一签名）。它不是私钥，请勿据此判断来源可信度。
+
+          ### 声明
+
+          - 本项目为**非官方修改版**，与原作者 achyuki 无隶属或授权关系。
+          - **仅供学习与技术研究使用，禁止商业用途**，请在下载后 24 小时内自行删除。
+          - 修改系统行为有风险，请自行备份并确认可恢复；作者不对任何损失负责。
+          - **如有侵权请联系删除**：请提交 [Issue](https://github.com/SQL0106/OAutoPIN/issues)，
+            我们会立即处理。若原作者希望停止分发，请告知，我们会立即配合。
+          - 保留上游 [MIT License](https://github.com/SQL0106/OAutoPIN/blob/main/LICENSE)。
+          EOF
+          echo "--- generated notes ---"
+          cat RELEASE_NOTES.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: OAutoPIN ${{ steps.ver.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          files: ${{ env.ASSET }}
+          draft: false
+          prerelease: false
+          make_latest: true

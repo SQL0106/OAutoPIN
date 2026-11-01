@@ -3,7 +3,7 @@ agp = "8.13.0"
 kotlin = "2.1.0"
 coreKtx = "1.17.0"
 appcompat = "1.7.1"
-xposed = "82"
+libxposed = "102.0.0"
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
@@ -13,4 +13,10 @@ kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
-xposed-api = { module = "de.robv.android.xposed:api", version.ref = "xposed" }
+# libxposed public API: only used to compile hooked code, the framework
+# provides it at runtime inside the target process.
+libxposed-api = { module = "io.github.libxposed:api", version.ref = "libxposed" }
+# libxposed service: must be packaged into the APK, because the settings UI
+# talks to the framework through XposedServiceHelper to reach the
+# framework-owned RemotePreferences that the hooked process reads.
+libxposed-service = { module = "io.github.libxposed:service", version.ref = "libxposed" }
