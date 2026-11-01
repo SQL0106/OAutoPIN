@@ -19,8 +19,8 @@ android {
         // Upstream "16" (versionCode 1) is the last achyuki release. This fork
         // adds the AFU gate (switchable), dual-SIM PINs and the libxposed 102
         // migration, all of which change runtime behaviour.
-        versionCode = 2
-        versionName = "17.0.0"
+        versionCode = 3
+        versionName = "17.1.0"
     }
 
     signingConfigs {

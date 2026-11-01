@@ -4,6 +4,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.os.UserManager
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
@@ -15,7 +19,9 @@ import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface
 import java.lang.ref.WeakReference
 import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.WeakHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Module entry point, declared in `META-INF/xposed/java_init.list` and driven by
@@ -79,6 +85,34 @@ class Hook : XposedModule() {
         /** Static so a hot reload does not register the receiver twice. */
         @Volatile
         private var unlockReceiverRegistered = false
+
+        /**
+         * Slots whose PIN was already submitted during this boot.
+         *
+         * Right after boot ColorOS can build a SIM PIN screen before telephony
+         * noticed that the card is usable, so the same slot shows up again. Keeping
+         * this set stops a second submission into a card that no longer needs it.
+         */
+        private val unlockedSlots: MutableSet<Int> =
+            Collections.synchronizedSet(LinkedHashSet<Int>())
+
+        /** Per-controller counters while telephony is still settling. */
+        private val stateRetries: MutableMap<Any, Int> =
+            Collections.synchronizedMap(IdentityHashMap<Any, Int>())
+
+        /** Guards the single screen-off/on resync allowed per boot. */
+        private val healedThisBoot = AtomicBoolean(false)
+
+        /** How often a not-yet-decided SIM state is re-checked, and how far apart. */
+        private const val MAX_STATE_RETRIES = 8
+        private const val STATE_RETRY_DELAY_MS = 400L
+
+        /**
+         * Delay before an already unlocked card's stale PIN screen is forced to
+         * re-read telephony state. Long enough for the submit path to finish and
+         * for Keyguard to tear the screen down by itself when it is in sync.
+         */
+        private const val HEAL_DELAY_MS = 800L
     }
 
     private var systemUiClassLoader: ClassLoader? = null
@@ -252,7 +286,186 @@ class Hook : XposedModule() {
             return
         }
 
-        dispatch(controller, config)
+        dispatchWithStateGate(controller, config)
+    }
+
+    /**
+     * Decides whether the card still needs a PIN before touching it.
+     *
+     * Right after boot SystemUI can rebuild the SIM PIN screen for a card that was
+     * already unblocked a few hundred milliseconds earlier: telephony has not
+     * published the new state yet, so the screen is shown again for a card that is
+     * READY. Submitting there is pointless and leaves a dead screen behind, so the
+     * screen is healed instead of filled. Conversely, while the modem is still
+     * initialising there is no state to act on at all, and the attempt is retried
+     * after a short delay rather than abandoned.
+     */
+    private fun dispatchWithStateGate(controller: Any, config: PinConfig) {
+        val slot = resolveSlot(controller)
+        val state = simStateOf(slot)
+
+        val alreadyUnlocked = slot != null &&
+            unlockedSlots.contains(slot) &&
+            state != TelephonyManager.SIM_STATE_PIN_REQUIRED
+        if (alreadyUnlocked) {
+            moduleLog(
+                this,
+                Log.INFO,
+                "slot ${slot + 1} already unlocked (state=${simStateName(state)}); " +
+                    "healing the stale screen instead of submitting again"
+            )
+            healStaleScreen(controller)
+            return
+        }
+
+        when (state) {
+            TelephonyManager.SIM_STATE_READY -> {
+                if (slot != null) unlockedSlots.add(slot)
+                moduleLog(
+                    this,
+                    Log.INFO,
+                    "slot ${slot?.plus(1) ?: "unknown"} is READY; nothing to submit"
+                )
+                healStaleScreen(controller)
+            }
+
+            TelephonyManager.SIM_STATE_UNKNOWN,
+            TelephonyManager.SIM_STATE_NOT_READY,
+            TelephonyManager.SIM_STATE_ABSENT -> {
+                moduleLog(
+                    this,
+                    Log.INFO,
+                    "slot ${slot?.plus(1) ?: "unknown"} state=${simStateName(state)}; " +
+                        "waiting for telephony before touching the card"
+                )
+                scheduleStateRetry(controller)
+            }
+
+            else -> dispatch(controller, config)
+        }
+    }
+
+    /** @return the telephony SIM state for [slot], or `null` when it cannot be read. */
+    private fun simStateOf(slot: Int?): Int? {
+        if (slot == null) return null
+        val hostContext = obtainContext() ?: return null
+        return try {
+            hostContext.getSystemService(TelephonyManager::class.java)?.getSimState(slot)
+        } catch (t: Throwable) {
+            moduleLog(this, Log.WARN, "getSimState($slot) failed: ${t.javaClass.name}")
+            null
+        }
+    }
+
+    private fun simStateName(state: Int?): String = when (state) {
+        null -> "unknown"
+        TelephonyManager.SIM_STATE_READY -> "READY"
+        TelephonyManager.SIM_STATE_PIN_REQUIRED -> "PIN_REQUIRED"
+        TelephonyManager.SIM_STATE_PUK_REQUIRED -> "PUK_REQUIRED"
+        TelephonyManager.SIM_STATE_NOT_READY -> "NOT_READY"
+        TelephonyManager.SIM_STATE_ABSENT -> "ABSENT"
+        TelephonyManager.SIM_STATE_PERM_DISABLED -> "PERM_DISABLED"
+        TelephonyManager.SIM_STATE_CARD_IO_ERROR -> "CARD_IO_ERROR"
+        TelephonyManager.SIM_STATE_CARD_RESTRICTED -> "CARD_RESTRICTED"
+        TelephonyManager.SIM_STATE_NETWORK_LOCKED -> "NETWORK_LOCKED"
+        else -> state.toString()
+    }
+
+    /**
+     * Retries [afterOnResume] a bounded number of times while the modem has not
+     * published a usable state yet. A bounded retry keeps a card that never becomes
+     * visible from spinning forever.
+     */
+    private fun scheduleStateRetry(controller: Any) {
+        val attempt = synchronized(stateRetries) {
+            val next = (stateRetries[controller] ?: 0) + 1
+            stateRetries[controller] = next
+            next
+        }
+        if (attempt > MAX_STATE_RETRIES) {
+            stateRetries.remove(controller)
+            moduleLog(
+                this,
+                Log.WARN,
+                "telephony state still unavailable after $MAX_STATE_RETRIES retries; " +
+                    "leaving the card untouched"
+            )
+            return
+        }
+        Handler(Looper.getMainLooper()).postDelayed({
+            safely { afterOnResume(controller) }
+        }, STATE_RETRY_DELAY_MS)
+    }
+
+    /**
+     * Heals the case where SystemUI still shows a SIM PIN page for a card that is
+     * already unblocked: the state change is re-broadcast so the keyguard relayouts,
+     * and if the screen survives that, one screen off/on cycle is performed, which
+     * is exactly what a user does by hand. The power cycle runs at most once per
+     * boot so a stuck screen cannot trap the device in a sleep loop.
+     */
+    private fun healStaleScreen(controller: Any) {
+        val view = readField(controller, "mView") as? View ?: return
+        Handler(Looper.getMainLooper()).postDelayed({
+            safely {
+                if (!view.isAttachedToWindow) return@safely
+                if (!healedThisBoot.compareAndSet(false, true)) return@safely
+                val hostContext = obtainContext() ?: return@safely
+                val power = hostContext.getSystemService(PowerManager::class.java)
+                    ?: return@safely
+                moduleLog(
+                    this,
+                    Log.INFO,
+                    "stale SIM page survived the state refresh; cycling the screen once"
+                )
+                callPowerMethod(power, "goToSleep")
+                Handler(Looper.getMainLooper()).postDelayed({
+                    safely {
+                        callPowerMethod(power, "wakeUp")
+                        moduleLog(this, Log.INFO, "screen cycled to clear the stale SIM page")
+                    }
+                }, 600L)
+            }
+        }, HEAL_DELAY_MS)
+    }
+
+    /**
+     * Calls a hidden `PowerManager` method by trying the known signatures.
+     *
+     * SystemUI runs with `DEVICE_POWER`, so this is permitted there; everywhere else
+     * it simply throws and is logged.
+     */
+    private fun callPowerMethod(power: PowerManager, name: String) {
+        val time = SystemClock.uptimeMillis()
+        val candidates = listOf(
+            arrayOf<Class<*>>(java.lang.Long.TYPE),
+            arrayOf<Class<*>>(java.lang.Long.TYPE, Integer.TYPE),
+            arrayOf<Class<*>>(java.lang.Long.TYPE, String::class.java)
+        )
+        for (types in candidates) {
+            try {
+                val method = power.javaClass.getMethod(name, *types)
+                when (types.size) {
+                    1 -> method.invoke(power, time)
+                    2 -> method.invoke(
+                        power,
+                        time,
+                        if (types[1] == Integer.TYPE) 0 else "oautopin"
+                    )
+                }
+                return
+            } catch (_: NoSuchMethodException) {
+                // try the next signature
+            } catch (t: Throwable) {
+                moduleLog(
+                    this,
+                    Log.WARN,
+                    "$name failed: ${t.javaClass.name}: ${t.message}"
+                )
+                return
+            }
+        }
+        moduleLog(this, Log.WARN, "$name not available on this build")
     }
 
     /** Submits the PIN for one controller, at most once per controller instance. */
@@ -292,10 +505,10 @@ class Hook : XposedModule() {
             Log.INFO,
             "dispatching PIN for slot ${slot?.plus(1) ?: "unknown"}"
         )
-        view.post { tryAutoVerify(controller, view, pin) }
+        view.post { tryAutoVerify(controller, view, pin, slot) }
     }
 
-    private fun tryAutoVerify(controller: Any, view: View, pin: String) {
+    private fun tryAutoVerify(controller: Any, view: View, pin: String, slot: Int?) {
         try {
             if (readField(controller, "isChecking") as? Boolean == true) {
                 moduleLog(this, Log.INFO, "isChecking=true, skip")
@@ -313,6 +526,7 @@ class Hook : XposedModule() {
 
             editText.setText(pin)
             invokeMethod(controller, "checkSimPikOrPuk")
+            if (slot != null) unlockedSlots.add(slot)
 
             moduleLog(this, Log.INFO, "auto verification dispatched successfully")
         } catch (t: Throwable) {
