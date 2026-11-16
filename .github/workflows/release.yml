@@ -23,7 +23,9 @@ permissions:
 jobs:
   release:
     name: Build, sign and publish
-    runs-on: ubuntu-latest
+    # x86_64 (see the note in android.yml): the arm64 hosted images have no
+    # Android SDK and there are no arm64 Linux build-tools.
+    runs-on: ubuntu-24.04
     steps:
       - name: Resolve version
         id: ver

@@ -18,7 +18,11 @@ concurrency:
 jobs:
   build:
     name: Build debug and release
-    runs-on: ubuntu-latest
+    # x86_64 on purpose. The arm64 hosted images (ubuntu-24.04-arm) ship no
+    # Android SDK, and Google publishes no arm64 Linux build-tools / aapt2, so
+    # an arm64 runner cannot assemble an APK. Pinned to 24.04 instead of
+    # ubuntu-latest so the toolchain does not move under us.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
